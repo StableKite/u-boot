@@ -137,12 +137,80 @@ static u32 decompress_zlib(const u8 *_cbuf, u32 clen, u8 *dbuf, u32 dlen)
 
 static u32 decompress_zstd(const u8 *cbuf, u32 clen, u8 *dbuf, u32 dlen)
 {
-	struct abuf in, out;
+	zstd_dctx *ctx;
+	size_t wsize, ret, frame_csize, out_len;
+	void *workspace;
+	unsigned long long fcs;
+	u8 *tmp = NULL;
+	u8 *out_buf = dbuf;
 
-	abuf_init_set(&in, (u8 *)cbuf, clen);
-	abuf_init_set(&out, dbuf, dlen);
+	out_len = dlen;
 
-	return zstd_decompress(&in, &out);
+	/*
+	 * Find the actual compressed frame size. BTRFS stores compressed
+	 * extents padded to sector boundaries, but zstd_decompress_dctx()
+	 * requires the exact frame size without trailing padding.
+	 */
+	frame_csize = zstd_find_frame_compressed_size(cbuf, clen);
+	if (!zstd_is_error(frame_csize))
+		clen = frame_csize;
+
+	/*
+	 * BTRFS compresses in sector-sized blocks, so the zstd frame may
+	 * decompress to a full sector (e.g. 4096) even when the actual
+	 * data (ram_bytes) is smaller. Allocate a larger buffer when needed
+	 * to avoid ZSTD_error_dstSize_tooSmall.
+	 */
+	fcs = ZSTD_getFrameContentSize(cbuf, clen);
+	if (fcs != ZSTD_CONTENTSIZE_ERROR &&
+	    fcs != ZSTD_CONTENTSIZE_UNKNOWN && fcs > dlen) {
+		if (fcs > SIZE_MAX)
+			return -1;
+		tmp = malloc(fcs);
+		if (!tmp)
+			return -1;
+		out_buf = tmp;
+		out_len = fcs;
+	}
+
+	wsize = zstd_dctx_workspace_bound();
+	workspace = malloc(wsize);
+	if (!workspace) {
+		free(tmp);
+		return -1;
+	}
+
+	ctx = zstd_init_dctx(workspace, wsize);
+	if (!ctx) {
+		free(workspace);
+		free(tmp);
+		return -1;
+	}
+
+	ret = zstd_decompress_dctx(ctx, out_buf, out_len, cbuf, clen);
+	free(workspace);
+
+	if (zstd_is_error(ret)) {
+		free(tmp);
+		return -1;
+	}
+
+	/*
+	 * The frame may carry sector padding past ram_bytes: never copy or
+	 * report more than dlen. A short result (ret < dlen) is not an
+	 * error: as in decompress_zlib() and decompress_lzo(), return the
+	 * actual decompressed length and let the read path zero-fill the
+	 * remainder of the destination.
+	 */
+	if (ret > dlen)
+		ret = dlen;
+
+	if (tmp) {
+		memcpy(dbuf, tmp, ret);
+		free(tmp);
+	}
+
+	return ret;
 }
 
 u32 btrfs_decompress(u8 type, const char *c, u32 clen, char *d, u32 dlen)
