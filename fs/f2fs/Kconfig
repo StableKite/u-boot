@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0+
+
+config FS_F2FS
+	bool "F2FS filesystem support (read-only)"
+	depends on BLK
+	help
+	  Enable read-only support for the Flash-Friendly File System (F2FS)
+	  in the generic U-Boot filesystem layer.
+
+	  This driver is intentionally limited to bootloader-safe operations:
+	  probing, listing directories, obtaining file size, reading files and
+	  exporting the filesystem UUID. It does not implement write, fsck,
+	  checkpoint roll-forward/NAT-journal replay, encryption, casefold lookup, or decompression
+	  of compressed files.
+
+	  For reliable boot media, create the F2FS volume cleanly, run fsck.f2fs,
+	  and avoid encrypted/casefolded/compressed boot files.

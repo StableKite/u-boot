@@ -32,6 +32,7 @@
 #include <squashfs.h>
 #include <erofs.h>
 #include <exfat.h>
+#include <f2fs.h>
 
 static struct blk_desc *fs_dev_desc;
 static int fs_dev_part;
@@ -400,6 +401,28 @@ static struct fstype_info fstypes[] = {
 		.mkdir = exfat_fs_mkdir,
 		.rename = exfat_fs_rename,
 	},
+#endif
+#if IS_ENABLED(CONFIG_FS_F2FS)
+{
+.fstype = FS_TYPE_F2FS,
+.name = "f2fs",
+.null_dev_desc_ok = false,
+.probe = f2fs_probe,
+.close = f2fs_close,
+.ls = fs_ls_generic,
+.opendir = f2fs_opendir,
+.readdir = f2fs_readdir,
+.closedir = f2fs_closedir,
+.exists = f2fs_exists,
+.size = f2fs_size,
+.read = f2fs_read,
+.uuid = f2fs_uuid,
+.write = fs_write_unsupported,
+.ln = fs_ln_unsupported,
+.unlink = fs_unlink_unsupported,
+.mkdir = fs_mkdir_unsupported,
+.rename = fs_rename_unsupported,
+},
 #endif
 	{
 		.fstype = FS_TYPE_ANY,
