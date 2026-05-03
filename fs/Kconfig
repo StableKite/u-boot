@@ -9,6 +9,7 @@ source "fs/btrfs/Kconfig"
 source "fs/cbfs/Kconfig"
 
 source "fs/exfat/Kconfig"
+source "fs/f2fs/Kconfig"
 
 source "fs/ext4/Kconfig"
 
