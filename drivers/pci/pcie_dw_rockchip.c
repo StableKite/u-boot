@@ -269,14 +269,14 @@ static int rk_pcie_link_up(struct rk_pcie *priv)
 		dm_gpio_set_value(&priv->rst_gpio, 1);
 
 	/* Check if the link is up or not */
-	for (retries = 0; retries < 10; retries++) {
+	for (retries = 0; retries < 25; retries++) {
 		if (is_link_up(priv))
 			break;
 
 		mdelay(100);
 	}
 
-	if (retries >= 10) {
+	if (retries >= 25) {
 		dev_err(priv->dw.dev, "PCIe-%d Link Fail\n",
 			dev_seq(priv->dw.dev));
 		return -EIO;
