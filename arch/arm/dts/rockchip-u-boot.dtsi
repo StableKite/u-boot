@@ -171,15 +171,15 @@
 				description = "NAME.dtb";
 				fdt = "fdt-SEQ";
 #ifdef CONFIG_ARM64
+#ifdef CONFIG_ROCKCHIP_RAW_BL32
+				fit,firmware = "atf-1", "u-boot", "tee";
+#else
 				fit,firmware = "atf-1", "u-boot";
+#endif
 #else
 				fit,firmware = "op-tee", "u-boot";
 #endif
-#ifdef CONFIG_ROCKCHIP_RAW_BL32
-				fit,loadables = "tee";
-#else
 				fit,loadables;
-#endif
 				fit,compatible;
 			};
 		};
