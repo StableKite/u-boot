@@ -809,3 +809,20 @@ config SPL_STACK_R_MALLOC_SIMPLE_LEN
 
 endif
 endif
+
+config ROCKCHIP_RAW_BL32
+	bool "Include raw Rockchip BL32 binary in SPL FIT"
+	depends on ARM64 && SPL_FIT
+	help
+	  Enable this when the BL31 image is an OPTEED build and the BL32
+	  payload is provided by rkbin as a raw rk3588_bl32_*.bin file rather
+	  than an ELF file. This keeps the generic split-ELF OP-TEE path intact
+	  for boards that provide tee.elf.
+
+config ROCKCHIP_RAW_BL32_LOAD_ADDR
+	hex "Raw Rockchip BL32 load address"
+	depends on ROCKCHIP_RAW_BL32
+	default 0x08400000
+	help
+	  Physical load and entry address used for raw Rockchip BL32/OP-TEE
+	  payloads in the SPL FIT.

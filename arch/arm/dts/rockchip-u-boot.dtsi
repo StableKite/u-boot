@@ -94,6 +94,25 @@
 				};
 #endif
 			};
+#ifdef CONFIG_ROCKCHIP_RAW_BL32
+			tee {
+				description = "TEE";
+				type = "tee";
+				arch = FIT_ARCH;
+				os = "tee";
+				compression = "none";
+				load = <CONFIG_ROCKCHIP_RAW_BL32_LOAD_ADDR>;
+				entry = <CONFIG_ROCKCHIP_RAW_BL32_LOAD_ADDR>;
+				tee-os {
+					optional;
+				};
+#ifdef FIT_HASH_ALGO
+				hash {
+					algo = FIT_HASH_ALGO;
+				};
+#endif
+			};
+#else
 			@tee-SEQ {
 				fit,operation = "split-elf";
 				description = "TEE";
@@ -104,7 +123,6 @@
 				fit,load;
 				fit,entry;
 				fit,data;
-
 				tee-os {
 					optional;
 				};
@@ -114,6 +132,7 @@
 				};
 #endif
 			};
+#endif
 #else /* !CONFIG_ARM64 */
 			op-tee {
 				description = "OP-TEE";
@@ -156,7 +175,11 @@
 #else
 				fit,firmware = "op-tee", "u-boot";
 #endif
+#ifdef CONFIG_ROCKCHIP_RAW_BL32
+				fit,loadables = "tee";
+#else
 				fit,loadables;
+#endif
 				fit,compatible;
 			};
 		};
