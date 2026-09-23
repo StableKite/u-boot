@@ -77,6 +77,9 @@ enum {
 	FAN53555_MONITOR,
 };
 
+#define RK8602_VSEL00x06
+#define RK8602_VSEL10x07
+
 struct fan53555_plat {
 	/* Voltage setting register */
 	unsigned int vol_reg;
@@ -144,7 +147,7 @@ static int fan53555_regulator_get_value(struct udevice *dev)
 	reg = pmic_reg_read(dev->parent, pdata->vol_reg);
 	if (reg < 0)
 		return reg;
-	voltage = priv->vsel_min + (reg & 0x3f) * priv->vsel_step;
+	voltage = priv->vsel_min + (reg & priv->vsel_mask) * priv->vsel_step;
 
 	debug("%s: %d uV\n", __func__, voltage);
 	return voltage;
