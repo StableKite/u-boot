@@ -54,8 +54,12 @@ static const struct {
 	{ FAN53555_VENDOR_FAIRCHILD, 0x8, 0x1, true,  600000, 10000 },
 	/* Option 08 */
 	{ FAN53555_VENDOR_FAIRCHILD, 0x8, 0xf, true,  600000, 10000 },
-	/* Option 09 */
-	{ FAN53555_VENDOR_FAIRCHILD, 0xc, 0xf, true,  603000, 12826 },
+    /* Option 09 */
+    { FAN53555_VENDOR_FAIRCHILD, 0xc, 0xf, true,  603000, 12826 },
+    /* RK8600 / RK8601 */
+    { FAN53555_VENDOR_ROCKCHIP,  0x8, 0x0, false, 712500, 12500 },
+    /* RK8602 / RK8603 */
+    { RK8602_VENDOR_ROCKCHIP,    0xa, 0x0, false, 500000,  6250 },
 	/* SYL82X */
 	{ FAN53555_VENDOR_SILERGY,   0x8, 0x0, false, 712500, 12500 },
 	/* SYL83X */
@@ -73,12 +77,14 @@ enum {
 	FAN53555_ID1,
 	/* IC mask version */
 	FAN53555_ID2,
-	/* Monitor register */
-	FAN53555_MONITOR,
+	/* Monitor register */    FAN53555_MONITOR,
 };
 
-#define RK8602_VSEL00x06
-#define RK8602_VSEL10x07
+#define FAN53555_NVOLTAGES 64
+#define RK8602_NVOLTAGES 160
+
+#define RK8602_VSEL0 0x06
+#define RK8602_VSEL1 0x07
 
 struct fan53555_plat {
 	/* Voltage setting register */
@@ -95,7 +101,9 @@ struct fan53555_priv {
 	unsigned int die_rev;
 	/* Voltage range and step(linear) */
 	unsigned int vsel_min;
-	unsigned int vsel_step;
+    unsigned int vsel_step;
+    unsigned int vsel_count;
+    unsigned int vsel_mask;
 	/* Voltage slew rate limiting */
 	unsigned int slew_rate;
 	/* Sleep voltage cache */
@@ -104,38 +112,45 @@ struct fan53555_priv {
 
 static int fan53555_regulator_of_to_plat(struct udevice *dev)
 {
-	struct fan53555_plat *plat = dev_get_plat(dev);
-	struct dm_regulator_uclass_plat *uc_pdata =
-		dev_get_uclass_plat(dev);
-	u32 sleep_vsel;
+    struct fan53555_plat *plat = dev_get_plat(dev);
+    struct dm_regulator_uclass_plat *uc_pdata =
+        dev_get_uclass_plat(dev);
+    unsigned int vsel0 = FAN53555_VSEL0;
+    unsigned int vsel1 = FAN53555_VSEL1;
+    u32 sleep_vsel;
 
-	/* This is a buck regulator */
-	uc_pdata->type = REGULATOR_TYPE_BUCK;
+    /* This is a buck regulator */
+    uc_pdata->type = REGULATOR_TYPE_BUCK;
 
-	sleep_vsel = dev_read_u32_default(dev, "fcs,suspend-voltage-selector",
-					  FAN53555_VSEL1);
+    /*
+     * RK8602/RK8603 use dedicated VSEL registers while the
+     * selector property continues to use logical values 0/1.
+     */
+    if (dev->driver_data == RK8602_VENDOR_ROCKCHIP) {
+        vsel0 = RK8602_VSEL0;
+        vsel1 = RK8602_VSEL1;
+    }
 
-	/*
-	 * Depending on the device-tree settings, the 'normal mode'
-	 * voltage is either controlled by VSEL0 or VSEL1.
-	 */
-	switch (sleep_vsel) {
-	case FAN53555_VSEL0:
-		plat->sleep_reg = FAN53555_VSEL0;
-		plat->vol_reg = FAN53555_VSEL1;
-		break;
-	case FAN53555_VSEL1:
-		plat->sleep_reg = FAN53555_VSEL1;
-		plat->vol_reg = FAN53555_VSEL0;
-		break;
-	default:
-		pr_err("%s: invalid vsel id %d\n", dev->name, sleep_vsel);
-		return -EINVAL;
-	}
+    sleep_vsel = dev_read_u32_default(dev,
+                     "fcs,suspend-voltage-selector",
+                     FAN53555_VSEL1);
 
-	return 0;
+    switch (sleep_vsel) {
+    case FAN53555_VSEL0:
+        plat->sleep_reg = vsel0;
+        plat->vol_reg = vsel1;
+        break;
+    case FAN53555_VSEL1:
+        plat->sleep_reg = vsel1;
+        plat->vol_reg = vsel0;
+        break;
+    default:
+        pr_err("%s: invalid vsel id %d\n", dev->name, sleep_vsel);
+        return -EINVAL;
+    }
+
+    return 0;
 }
-
 static int fan53555_regulator_get_value(struct udevice *dev)
 {
 	struct fan53555_plat *pdata = dev_get_plat(dev);
@@ -147,53 +162,66 @@ static int fan53555_regulator_get_value(struct udevice *dev)
 	reg = pmic_reg_read(dev->parent, pdata->vol_reg);
 	if (reg < 0)
 		return reg;
-	voltage = priv->vsel_min + (reg & priv->vsel_mask) * priv->vsel_step;
-
+    voltage = priv->vsel_min +
+          (reg & priv->vsel_mask) * priv->vsel_step;
 	debug("%s: %d uV\n", __func__, voltage);
 	return voltage;
 }
 
 static int fan53555_regulator_set_value(struct udevice *dev, int uV)
 {
-	struct fan53555_plat *pdata = dev_get_plat(dev);
-	struct fan53555_priv *priv = dev_get_priv(dev);
-	u8 vol;
+    struct fan53555_plat *pdata = dev_get_plat(dev);
+    struct fan53555_priv *priv = dev_get_priv(dev);
+    unsigned int vol;
 
-	vol = (uV - priv->vsel_min) / priv->vsel_step;
-	debug("%s: uV=%d; writing volume %d: %02x\n",
-	      __func__, uV, pdata->vol_reg, vol);
+    if (uV < priv->vsel_min)
+        return -EINVAL;
 
-	return pmic_clrsetbits(dev->parent, pdata->vol_reg, GENMASK(6, 0), vol);
+    vol = (uV - priv->vsel_min) / priv->vsel_step;
+    if (vol >= priv->vsel_count)
+        return -EINVAL;
+
+    debug("%s: uV=%d; writing volume %d: %02x\n",
+          __func__, uV, pdata->vol_reg, vol);
+
+    return pmic_clrsetbits(dev->parent, pdata->vol_reg,
+                   priv->vsel_mask, vol);
 }
-
 static int fan53555_voltages_setup(struct udevice *dev)
 {
-	struct fan53555_priv *priv = dev_get_priv(dev);
-	int i;
+    struct fan53555_priv *priv = dev_get_priv(dev);
+    int i;
 
-	/* Init voltage range and step */
-	for (i = 0; i < ARRAY_SIZE(ic_types); ++i) {
-		if (ic_types[i].vendor != priv->vendor)
-			continue;
+    for (i = 0; i < ARRAY_SIZE(ic_types); ++i) {
+        if (ic_types[i].vendor != priv->vendor)
+            continue;
 
-		if (ic_types[i].die_id != priv->die_id)
-			continue;
+        if (ic_types[i].die_id != priv->die_id)
+            continue;
 
-		if (ic_types[i].check_rev &&
-		    ic_types[i].die_rev != priv->die_rev)
-			continue;
+        if (ic_types[i].check_rev &&
+            ic_types[i].die_rev != priv->die_rev)
+            continue;
 
-		priv->vsel_min = ic_types[i].vsel_min;
-		priv->vsel_step = ic_types[i].vsel_step;
+        priv->vsel_min = ic_types[i].vsel_min;
+        priv->vsel_step = ic_types[i].vsel_step;
 
-		return 0;
-	}
+        if (priv->vendor == RK8602_VENDOR_ROCKCHIP) {
+            priv->vsel_count = RK8602_NVOLTAGES;
+            priv->vsel_mask = GENMASK(7, 0);
+        } else {
+            priv->vsel_count = FAN53555_NVOLTAGES;
+            priv->vsel_mask = GENMASK(5, 0);
+        }
 
-	pr_err("%s: %s: die id %d rev %d not supported!\n",
-	       dev->name, __func__, priv->die_id, priv->die_rev);
-	return -EINVAL;
+        return 0;
+    }
+
+    pr_err("%s: %s: die id %d rev %d not supported!\n",
+           dev->name, __func__, priv->die_id, priv->die_rev);
+
+    return -EINVAL;
 }
-
 enum {
 	DIE_ID_SHIFT = 0,
 	DIE_ID_WIDTH = 4,

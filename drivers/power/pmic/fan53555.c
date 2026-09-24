@@ -72,7 +72,9 @@ static struct dm_pmic_ops pmic_fan53555_ops = {
 };
 
 static const struct udevice_id pmic_fan53555_match[] = {
-	{ .compatible = "fcs,fan53555", .data = FAN53555_VENDOR_FAIRCHILD, },
+    { .compatible = "fcs,fan53555", .data = FAN53555_VENDOR_FAIRCHILD, },
+    { .compatible = "rockchip,rk8600", .data = FAN53555_VENDOR_ROCKCHIP, },
+    { .compatible = "rockchip,rk8602", .data = RK8602_VENDOR_ROCKCHIP, },
 	{ .compatible = "silergy,syr827", .data = FAN53555_VENDOR_SILERGY, },
 	{ .compatible = "silergy,syr828", .data = FAN53555_VENDOR_SILERGY, },
 	{ },
