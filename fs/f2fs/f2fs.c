@@ -459,42 +459,74 @@ static int f2fs_read_super(void)
 	return 0;
 }
 
+static u32 f2fs_checkpoint_crc(u32 crc, const u8 *data, u32 length)
+{
+	unsigned int bit;
+
+	while (length--) {
+		crc ^= *data++;
+		for (bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320U : 0);
+	}
+	return crc;
+}
+
+static bool f2fs_checkpoint_crc_valid(const struct f2fs_checkpoint *cp)
+{
+	const u8 *raw = (const u8 *)cp;
+	u32 offset = le32_to_cpu(cp->checksum_offset);
+	__le32 stored;
+	u32 crc;
+
+	if (offset < offsetof(struct f2fs_checkpoint, sit_nat_version_bitmap) ||
+	    offset > F2FS_BLKSIZE - sizeof(stored))
+		return false;
+	memcpy(&stored, raw + offset, sizeof(stored));
+	crc = f2fs_checkpoint_crc(F2FS_SUPER_MAGIC, raw, offset);
+	if (offset < F2FS_BLKSIZE - sizeof(stored)) {
+		offset += sizeof(stored);
+		crc = f2fs_checkpoint_crc(crc, raw + offset, F2FS_BLKSIZE - offset);
+	}
+	return crc == le32_to_cpu(stored);
+}
+
 static int f2fs_read_checkpoint_pack(u32 start_blk, struct f2fs_checkpoint **cpp,
 				     u64 *versionp)
 {
-	struct f2fs_checkpoint *cp;
-	u32 total;
-	u32 bytes;
+	struct f2fs_checkpoint *cp, *last;
+	u32 total, bytes, summary;
 	int ret;
 
 	cp = malloc(F2FS_BLKSIZE);
 	if (!cp)
 		return -ENOMEM;
-
 	ret = f2fs_read_block(start_blk, cp);
 	if (ret)
 		goto fail;
-
 	total = le32_to_cpu(cp->cp_pack_total_block_count);
-	if (!total || total > gctx.blocks_per_seg * 2) {
+	summary = le32_to_cpu(cp->cp_pack_start_sum);
+	if (!f2fs_checkpoint_crc_valid(cp) || total <= 2 ||
+	    total > gctx.blocks_per_seg || !summary || summary >= total - 1) {
 		ret = -EINVAL;
 		goto fail;
 	}
-
 	bytes = total * F2FS_BLKSIZE;
 	free(cp);
 	cp = malloc(bytes);
 	if (!cp)
 		return -ENOMEM;
-
 	ret = f2fs_read_bytes((u64)start_blk * F2FS_BLKSIZE, cp, bytes);
 	if (ret)
 		goto fail;
-
+	last = (struct f2fs_checkpoint *)((u8 *)cp + bytes - F2FS_BLKSIZE);
+	if (!f2fs_checkpoint_crc_valid(cp) || !f2fs_checkpoint_crc_valid(last) ||
+	    cp->checkpoint_ver != last->checkpoint_ver) {
+		ret = -EINVAL;
+		goto fail;
+	}
 	*versionp = le64_to_cpu(cp->checkpoint_ver);
 	*cpp = cp;
 	return 0;
-
 fail:
 	free(cp);
 	return ret;
@@ -565,7 +597,7 @@ static int f2fs_read_checkpoint(void)
 	if (ret0 && ret1)
 		return -EINVAL;
 
-	if (!ret1 && (ret0 || ver1 > ver0)) {
+	if (!ret1 && (ret0 || (s64)(ver1 - ver0) > 0)) {
 		free(cp0);
 		gctx.cp = cp1;
 		gctx.cp_start_blk = cp_blk + gctx.blocks_per_seg;
@@ -576,9 +608,18 @@ static int f2fs_read_checkpoint(void)
 	}
 
 	flags = le32_to_cpu(gctx.cp->ckpt_flags);
-	if (!(flags & CP_UMOUNT_FLAG) ||
-	    (flags & (CP_ERROR_FLAG | CP_FSCK_FLAG | CP_DISABLED_FLAG)))
+	/* Read the last committed checkpoint after an interrupted shutdown.
+	 * Linux performs roll-forward recovery after the kernel has booted.
+	 */
+	if (flags & (CP_ERROR_FLAG | CP_FSCK_FLAG | CP_DISABLED_FLAG))
 		return -EINVAL;
+
+	if (le32_to_cpu(gctx.sb.cp_payload) ||
+	    (u64)offsetof(struct f2fs_checkpoint, sit_nat_version_bitmap) +
+	    le32_to_cpu(gctx.cp->sit_ver_bitmap_bytesize) +
+	    le32_to_cpu(gctx.cp->nat_ver_bitmap_bytesize) >
+	    le32_to_cpu(gctx.cp->checksum_offset))
+		return -ENOTSUPP;
 
 	gctx.nat_bitmap_bytes = le32_to_cpu(gctx.cp->nat_ver_bitmap_bytesize);
 	gctx.nat_bitmap = gctx.cp->sit_nat_version_bitmap +
