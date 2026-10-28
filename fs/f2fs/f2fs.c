@@ -1018,7 +1018,7 @@ static int f2fs_lookup_in_dir(const struct f2fs_node *dir, const char *name,
 	struct f2fs_node child;
 	int ret;
 
-	if (!(le16_to_cpu(dir->i.i_mode) & S_IFDIR))
+	if ((le16_to_cpu(dir->i.i_mode) & S_IFMT) != S_IFDIR)
 		return -ENOTDIR;
 
 	if (name_len == 1 && name[0] == '.') {
@@ -1049,57 +1049,96 @@ static int f2fs_lookup_in_dir(const struct f2fs_node *dir, const char *name,
 static int f2fs_find_path(const char *path, struct f2fs_node *node, u32 *nidp)
 {
 	char comp[F2FS_MAX_NAME_LEN + 1];
-	const char *p = path;
-	u32 nid = le32_to_cpu(gctx.sb.root_ino);
+	char *pending, *link, *p;
+	u32 root = le32_to_cpu(gctx.sb.root_ino), nid = root;
+	unsigned int links = 0;
 	int ret;
 
 	if (!path || !*path)
 		return -EINVAL;
-
+	if (strnlen(path, 4096) >= 4096)
+		return -ENAMETOOLONG;
+	pending = malloc(4096);
+	link = malloc(4096);
+	if (!pending || !link) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	strcpy(pending, path);
+	p = pending;
 	ret = f2fs_read_node(nid, node);
 	if (ret)
-		return ret;
-
+		goto out;
 	while (*p == '/')
 		p++;
 
-	if (!*p) {
-		if (nidp)
-			*nidp = nid;
-		return 0;
-	}
-
 	while (*p) {
-		const char *slash = strchr(p, '/');
+		char *slash = strchr(p, '/');
 		unsigned int len = slash ? (unsigned int)(slash - p) : strlen(p);
+		char *rest = slash ? slash + 1 : p + len;
 		struct f2fs_lookup_res res;
+		u32 parent = nid;
 
-		if (!len || len > F2FS_MAX_NAME_LEN)
-			return -EINVAL;
+		if (!len || len > F2FS_MAX_NAME_LEN) {
+			ret = -ENAMETOOLONG;
+			goto out;
+		}
 		memcpy(comp, p, len);
 		comp[len] = '\0';
-
-		if (len == 2 && comp[0] == '.' && comp[1] == '.')
-			return -ENOTSUPP;
-
+		while (*rest == '/')
+			rest++;
 		ret = f2fs_lookup_in_dir(node, comp, len, &res);
 		if (ret)
-			return ret;
-
+			goto out;
 		nid = res.nid;
 		ret = f2fs_read_node(nid, node);
 		if (ret)
-			return ret;
+			goto out;
 
-		p = slash ? slash + 1 : p + len;
-		while (*p == '/')
-			p++;
+		if ((le16_to_cpu(node->i.i_mode) & S_IFMT) == S_IFLNK) {
+			u64 size = le64_to_cpu(node->i.i_size);
+			loff_t actual = 0;
+			size_t remainder = strlen(rest);
+
+			if (++links > F2FS_MAX_LINK_DEPTH) {
+				ret = -ELOOP;
+				goto out;
+			}
+			if (!size || size >= 4096 || size + 1 + remainder >= 4096) {
+				ret = -ENAMETOOLONG;
+				goto out;
+			}
+			ret = f2fs_read_inode_data(node, link, 0, size, &actual);
+			if (ret)
+				goto out;
+			if (actual != size || memchr(link, '\0', size)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			link[size] = '\0';
+			memmove(pending + size + 1, rest, remainder + 1);
+			memcpy(pending, link, size);
+			pending[size] = '/';
+			nid = link[0] == '/' ? root : parent;
+			ret = f2fs_read_node(nid, node);
+			if (ret)
+				goto out;
+			p = pending;
+			while (*p == '/')
+				p++;
+		} else {
+			p = rest;
+		}
 	}
-
 	if (nidp)
 		*nidp = nid;
-	return 0;
+	ret = 0;
+out:
+	free(link);
+	free(pending);
+	return ret;
 }
+
 
 static void f2fs_fill_dirent(struct fs_dirent *dent, const char *name,
 			     unsigned int name_len, const struct f2fs_node *node)
@@ -1273,7 +1312,7 @@ int f2fs_opendir(const char *filename, struct fs_dir_stream **dirsp)
 	if (ret)
 		goto fail;
 
-	if (!(le16_to_cpu(s->dir.i.i_mode) & S_IFDIR)) {
+	if ((le16_to_cpu(s->dir.i.i_mode) & S_IFMT) != S_IFDIR) {
 		ret = -ENOTDIR;
 		goto fail;
 	}
