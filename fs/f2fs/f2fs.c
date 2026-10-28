@@ -350,6 +350,12 @@ static int f2fs_get_bit(const __u8 *bitmap, unsigned int bit)
 	return !!(bitmap[bit >> 3] & BIT(bit & 7));
 }
 
+/* Version bitmaps are MSB-first; directory bitmaps above are LSB-first. */
+static int f2fs_get_version_bit(const __u8 *bitmap, unsigned int bit)
+{
+	return !!(bitmap[bit >> 3] & BIT(7 - (bit & 7)));
+}
+
 static unsigned int f2fs_slots(unsigned int name_len)
 {
 	return DIV_ROUND_UP(name_len, F2FS_SLOT_LEN);
@@ -654,11 +660,15 @@ static int f2fs_read_nat_entry(u32 nid, struct f2fs_nat_entry *entry)
 	if (!nat_blocks_per_set || block_off >= nat_blocks_per_set)
 		return -EINVAL;
 
-	if (block_off / 8 < gctx.nat_bitmap_bytes &&
-	    f2fs_get_bit(gctx.nat_bitmap, block_off))
+	if (block_off / 8 >= gctx.nat_bitmap_bytes)
+		return -EINVAL;
+	if (f2fs_get_version_bit(gctx.nat_bitmap, block_off))
 		set = 1;
 
-	blkaddr = le32_to_cpu(gctx.sb.nat_blkaddr) + set * nat_blocks_per_set + block_off;
+	/* NAT copies alternate by segment, not by whole NAT area. */
+	blkaddr = le32_to_cpu(gctx.sb.nat_blkaddr) + (block_off << 1) -
+		(block_off & (gctx.blocks_per_seg - 1)) +
+		set * gctx.blocks_per_seg;
 	blk = malloc(sizeof(*blk));
 	if (!blk)
 		return -ENOMEM;
