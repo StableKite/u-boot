@@ -350,6 +350,12 @@ static int f2fs_get_bit(const __u8 *bitmap, unsigned int bit)
 	return !!(bitmap[bit >> 3] & BIT(bit & 7));
 }
 
+/* Version bitmaps are MSB-first; directory bitmaps above are LSB-first. */
+static int f2fs_get_version_bit(const __u8 *bitmap, unsigned int bit)
+{
+	return !!(bitmap[bit >> 3] & BIT(7 - (bit & 7)));
+}
+
 static unsigned int f2fs_slots(unsigned int name_len)
 {
 	return DIV_ROUND_UP(name_len, F2FS_SLOT_LEN);
@@ -459,42 +465,74 @@ static int f2fs_read_super(void)
 	return 0;
 }
 
+static u32 f2fs_checkpoint_crc(u32 crc, const u8 *data, u32 length)
+{
+	unsigned int bit;
+
+	while (length--) {
+		crc ^= *data++;
+		for (bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320U : 0);
+	}
+	return crc;
+}
+
+static bool f2fs_checkpoint_crc_valid(const struct f2fs_checkpoint *cp)
+{
+	const u8 *raw = (const u8 *)cp;
+	u32 offset = le32_to_cpu(cp->checksum_offset);
+	__le32 stored;
+	u32 crc;
+
+	if (offset < offsetof(struct f2fs_checkpoint, sit_nat_version_bitmap) ||
+	    offset > F2FS_BLKSIZE - sizeof(stored))
+		return false;
+	memcpy(&stored, raw + offset, sizeof(stored));
+	crc = f2fs_checkpoint_crc(F2FS_SUPER_MAGIC, raw, offset);
+	if (offset < F2FS_BLKSIZE - sizeof(stored)) {
+		offset += sizeof(stored);
+		crc = f2fs_checkpoint_crc(crc, raw + offset, F2FS_BLKSIZE - offset);
+	}
+	return crc == le32_to_cpu(stored);
+}
+
 static int f2fs_read_checkpoint_pack(u32 start_blk, struct f2fs_checkpoint **cpp,
 				     u64 *versionp)
 {
-	struct f2fs_checkpoint *cp;
-	u32 total;
-	u32 bytes;
+	struct f2fs_checkpoint *cp, *last;
+	u32 total, bytes, summary;
 	int ret;
 
 	cp = malloc(F2FS_BLKSIZE);
 	if (!cp)
 		return -ENOMEM;
-
 	ret = f2fs_read_block(start_blk, cp);
 	if (ret)
 		goto fail;
-
 	total = le32_to_cpu(cp->cp_pack_total_block_count);
-	if (!total || total > gctx.blocks_per_seg * 2) {
+	summary = le32_to_cpu(cp->cp_pack_start_sum);
+	if (!f2fs_checkpoint_crc_valid(cp) || total <= 2 ||
+	    total > gctx.blocks_per_seg || !summary || summary >= total - 1) {
 		ret = -EINVAL;
 		goto fail;
 	}
-
 	bytes = total * F2FS_BLKSIZE;
 	free(cp);
 	cp = malloc(bytes);
 	if (!cp)
 		return -ENOMEM;
-
 	ret = f2fs_read_bytes((u64)start_blk * F2FS_BLKSIZE, cp, bytes);
 	if (ret)
 		goto fail;
-
+	last = (struct f2fs_checkpoint *)((u8 *)cp + bytes - F2FS_BLKSIZE);
+	if (!f2fs_checkpoint_crc_valid(cp) || !f2fs_checkpoint_crc_valid(last) ||
+	    cp->checkpoint_ver != last->checkpoint_ver) {
+		ret = -EINVAL;
+		goto fail;
+	}
 	*versionp = le64_to_cpu(cp->checkpoint_ver);
 	*cpp = cp;
 	return 0;
-
 fail:
 	free(cp);
 	return ret;
@@ -565,7 +603,7 @@ static int f2fs_read_checkpoint(void)
 	if (ret0 && ret1)
 		return -EINVAL;
 
-	if (!ret1 && (ret0 || ver1 > ver0)) {
+	if (!ret1 && (ret0 || (s64)(ver1 - ver0) > 0)) {
 		free(cp0);
 		gctx.cp = cp1;
 		gctx.cp_start_blk = cp_blk + gctx.blocks_per_seg;
@@ -576,9 +614,18 @@ static int f2fs_read_checkpoint(void)
 	}
 
 	flags = le32_to_cpu(gctx.cp->ckpt_flags);
-	if (!(flags & CP_UMOUNT_FLAG) ||
-	    (flags & (CP_ERROR_FLAG | CP_FSCK_FLAG | CP_DISABLED_FLAG)))
+	/* Read the last committed checkpoint after an interrupted shutdown.
+	 * Linux performs roll-forward recovery after the kernel has booted.
+	 */
+	if (flags & (CP_ERROR_FLAG | CP_FSCK_FLAG | CP_DISABLED_FLAG))
 		return -EINVAL;
+
+	if (le32_to_cpu(gctx.sb.cp_payload) ||
+	    (u64)offsetof(struct f2fs_checkpoint, sit_nat_version_bitmap) +
+	    le32_to_cpu(gctx.cp->sit_ver_bitmap_bytesize) +
+	    le32_to_cpu(gctx.cp->nat_ver_bitmap_bytesize) >
+	    le32_to_cpu(gctx.cp->checksum_offset))
+		return -ENOTSUPP;
 
 	gctx.nat_bitmap_bytes = le32_to_cpu(gctx.cp->nat_ver_bitmap_bytesize);
 	gctx.nat_bitmap = gctx.cp->sit_nat_version_bitmap +
@@ -613,11 +660,15 @@ static int f2fs_read_nat_entry(u32 nid, struct f2fs_nat_entry *entry)
 	if (!nat_blocks_per_set || block_off >= nat_blocks_per_set)
 		return -EINVAL;
 
-	if (block_off / 8 < gctx.nat_bitmap_bytes &&
-	    f2fs_get_bit(gctx.nat_bitmap, block_off))
+	if (block_off / 8 >= gctx.nat_bitmap_bytes)
+		return -EINVAL;
+	if (f2fs_get_version_bit(gctx.nat_bitmap, block_off))
 		set = 1;
 
-	blkaddr = le32_to_cpu(gctx.sb.nat_blkaddr) + set * nat_blocks_per_set + block_off;
+	/* NAT copies alternate by segment, not by whole NAT area. */
+	blkaddr = le32_to_cpu(gctx.sb.nat_blkaddr) + (block_off << 1) -
+		(block_off & (gctx.blocks_per_seg - 1)) +
+		set * gctx.blocks_per_seg;
 	blk = malloc(sizeof(*blk));
 	if (!blk)
 		return -ENOMEM;
@@ -1018,7 +1069,7 @@ static int f2fs_lookup_in_dir(const struct f2fs_node *dir, const char *name,
 	struct f2fs_node child;
 	int ret;
 
-	if (!(le16_to_cpu(dir->i.i_mode) & S_IFDIR))
+	if ((le16_to_cpu(dir->i.i_mode) & S_IFMT) != S_IFDIR)
 		return -ENOTDIR;
 
 	if (name_len == 1 && name[0] == '.') {
@@ -1049,57 +1100,96 @@ static int f2fs_lookup_in_dir(const struct f2fs_node *dir, const char *name,
 static int f2fs_find_path(const char *path, struct f2fs_node *node, u32 *nidp)
 {
 	char comp[F2FS_MAX_NAME_LEN + 1];
-	const char *p = path;
-	u32 nid = le32_to_cpu(gctx.sb.root_ino);
+	char *pending, *link, *p;
+	u32 root = le32_to_cpu(gctx.sb.root_ino), nid = root;
+	unsigned int links = 0;
 	int ret;
 
 	if (!path || !*path)
 		return -EINVAL;
-
+	if (strnlen(path, 4096) >= 4096)
+		return -ENAMETOOLONG;
+	pending = malloc(4096);
+	link = malloc(4096);
+	if (!pending || !link) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	strcpy(pending, path);
+	p = pending;
 	ret = f2fs_read_node(nid, node);
 	if (ret)
-		return ret;
-
+		goto out;
 	while (*p == '/')
 		p++;
 
-	if (!*p) {
-		if (nidp)
-			*nidp = nid;
-		return 0;
-	}
-
 	while (*p) {
-		const char *slash = strchr(p, '/');
+		char *slash = strchr(p, '/');
 		unsigned int len = slash ? (unsigned int)(slash - p) : strlen(p);
+		char *rest = slash ? slash + 1 : p + len;
 		struct f2fs_lookup_res res;
+		u32 parent = nid;
 
-		if (!len || len > F2FS_MAX_NAME_LEN)
-			return -EINVAL;
+		if (!len || len > F2FS_MAX_NAME_LEN) {
+			ret = -ENAMETOOLONG;
+			goto out;
+		}
 		memcpy(comp, p, len);
 		comp[len] = '\0';
-
-		if (len == 2 && comp[0] == '.' && comp[1] == '.')
-			return -ENOTSUPP;
-
+		while (*rest == '/')
+			rest++;
 		ret = f2fs_lookup_in_dir(node, comp, len, &res);
 		if (ret)
-			return ret;
-
+			goto out;
 		nid = res.nid;
 		ret = f2fs_read_node(nid, node);
 		if (ret)
-			return ret;
+			goto out;
 
-		p = slash ? slash + 1 : p + len;
-		while (*p == '/')
-			p++;
+		if ((le16_to_cpu(node->i.i_mode) & S_IFMT) == S_IFLNK) {
+			u64 size = le64_to_cpu(node->i.i_size);
+			loff_t actual = 0;
+			size_t remainder = strlen(rest);
+
+			if (++links > F2FS_MAX_LINK_DEPTH) {
+				ret = -ELOOP;
+				goto out;
+			}
+			if (!size || size >= 4096 || size + 1 + remainder >= 4096) {
+				ret = -ENAMETOOLONG;
+				goto out;
+			}
+			ret = f2fs_read_inode_data(node, link, 0, size, &actual);
+			if (ret)
+				goto out;
+			if (actual != size || memchr(link, '\0', size)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			link[size] = '\0';
+			memmove(pending + size + 1, rest, remainder + 1);
+			memcpy(pending, link, size);
+			pending[size] = '/';
+			nid = link[0] == '/' ? root : parent;
+			ret = f2fs_read_node(nid, node);
+			if (ret)
+				goto out;
+			p = pending;
+			while (*p == '/')
+				p++;
+		} else {
+			p = rest;
+		}
 	}
-
 	if (nidp)
 		*nidp = nid;
-	return 0;
+	ret = 0;
+out:
+	free(link);
+	free(pending);
+	return ret;
 }
+
 
 static void f2fs_fill_dirent(struct fs_dirent *dent, const char *name,
 			     unsigned int name_len, const struct f2fs_node *node)
@@ -1273,7 +1363,7 @@ int f2fs_opendir(const char *filename, struct fs_dir_stream **dirsp)
 	if (ret)
 		goto fail;
 
-	if (!(le16_to_cpu(s->dir.i.i_mode) & S_IFDIR)) {
+	if ((le16_to_cpu(s->dir.i.i_mode) & S_IFMT) != S_IFDIR) {
 		ret = -ENOTDIR;
 		goto fail;
 	}
